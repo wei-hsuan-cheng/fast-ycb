@@ -1,24 +1,266 @@
-SERVER=https://dataverse.iit.it
-PERSISTENT_ID=doi:10.48557/G2QJDM
-VERSION=:latest
+#!/usr/bin/env bash
 
-# Download the json file
-curl $SERVER/api/datasets/:persistentId/versions/$VERSION/files?persistentId=$PERSISTENT_ID > dataset.json
+# Download one or more Fast-YCB object sequences from the IIT Dataverse.
+# Run this script from any directory; sequences are extracted at the repository
+# root next to README.md.
+#
+# Usage:
+#   bash tools/download/download_dataset.sh [--force] <object_name> ...
+#
+# Example:
+#   bash tools/download/download_dataset.sh 006_mustard_bottle_real
 
-# Download all files in the dataset
-NUM_FILES=`cat dataset.json | jq ".data | length - 1"`
-for i in $(seq 0 $NUM_FILES); do
-    echo "Downloading file $i/$NUM_FILES..."
-    file_id=`cat dataset.json | jq ".data[$i].dataFile.id"`
-    file_name=`cat dataset.json | jq ".data[$i].dataFile.filename" | tr -d '"'`
-    curl -L $SERVER/api/access/datafile/$file_id -o $file_name
+set -euo pipefail
+
+server="https://dataverse.iit.it"
+persistent_id="doi:10.48557/G2QJDM"
+version=":latest"
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+dataset_root="$(cd "${script_dir}/../.." && pwd)"
+download_root="${dataset_root}/.downloads"
+metadata_path="${download_root}/dataset.json"
+force=false
+objects=()
+
+usage() {
+  cat <<EOF
+Usage:
+  bash tools/download/download_dataset.sh [--force] <object_name> ...
+
+Arguments:
+  object_name  One or more Fast-YCB sequence names, for example:
+               006_mustard_bottle_real
+
+Options:
+  --force      Replace an existing extracted sequence after the new archive
+               has been downloaded, verified, and extracted successfully
+  -h, --help   Show this help
+
+Example:
+  bash tools/download/download_dataset.sh 006_mustard_bottle_real
+EOF
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --force)
+      force=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while (( $# > 0 )); do
+        objects+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "Error: unknown option '$1'." >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      objects+=("$1")
+      shift
+      ;;
+  esac
 done
 
-# Unzip all objects
-for object_name in 003_cracker_box 004_sugar_box 005_tomato_soup_can 006_mustard_bottle 009_gelatin_box 010_potted_meat_can 003_cracker_box_real 006_mustard_bottle_real; do
-    echo "Unzipping file ${object_name}.zip..."
-    zip -qq -F ${object_name}.zip --out tmp.zip
-    rm ${object_name}.z*
-    unzip -qq tmp.zip
-    rm tmp.zip
+if (( ${#objects[@]} == 0 )); then
+  usage >&2
+  exit 2
+fi
+
+for object_name in "${objects[@]}"; do
+  if [[ ! "${object_name}" =~ ^[0-9]{3}_[a-z0-9_]+$ ]]; then
+    echo "Error: '${object_name}' must look like 006_mustard_bottle_real." >&2
+    exit 2
+  fi
+
+  destination="${dataset_root}/${object_name}"
+  if [[ -e "${destination}" && "${force}" != true ]]; then
+    echo "Error: ${destination} already exists." >&2
+    echo "Use --force to replace it after a successful staged download." >&2
+    exit 2
+  fi
 done
+
+for required_command in curl jq zip unzip; do
+  if ! command -v "${required_command}" >/dev/null 2>&1; then
+    echo "Error: required command '${required_command}' is not installed." >&2
+    exit 1
+  fi
+done
+
+if command -v md5sum >/dev/null 2>&1; then
+  calculate_md5() {
+    md5sum "$1" | awk '{print $1}'
+  }
+elif command -v md5 >/dev/null 2>&1; then
+  calculate_md5() {
+    md5 -q "$1"
+  }
+else
+  echo "Error: md5sum or md5 is required for archive verification." >&2
+  exit 1
+fi
+
+mkdir -p "${download_root}"
+
+metadata_url="${server}/api/datasets/:persistentId/versions/${version}/files?persistentId=${persistent_id}"
+echo "Reading Fast-YCB dataset metadata..."
+curl -fL --retry 3 --retry-delay 2 \
+  "${metadata_url}" -o "${metadata_path}.tmp"
+mv "${metadata_path}.tmp" "${metadata_path}"
+
+if [[ "$(jq -r '.status // empty' "${metadata_path}")" != "OK" ]]; then
+  echo "Error: IIT Dataverse returned invalid dataset metadata." >&2
+  exit 1
+fi
+
+download_file() {
+  local file_id="$1"
+  local filename="$2"
+  local expected_md5="$3"
+  local output_path="$4"
+  local file_url="${server}/api/access/datafile/${file_id}"
+  local actual_md5
+
+  if [[ -f "${output_path}" ]]; then
+    actual_md5="$(calculate_md5 "${output_path}")"
+    if [[ "${actual_md5}" == "${expected_md5}" ]]; then
+      echo "Using verified download ${filename}."
+      return
+    fi
+    echo "Resuming incomplete download ${filename}..."
+  else
+    echo "Downloading ${filename}..."
+  fi
+
+  if ! curl -fL --retry 5 --retry-delay 2 -C - \
+    "${file_url}" -o "${output_path}"; then
+    echo "Resume was unavailable; restarting ${filename}..."
+    rm -f "${output_path}"
+    curl -fL --retry 5 --retry-delay 2 \
+      "${file_url}" -o "${output_path}"
+  fi
+
+  actual_md5="$(calculate_md5 "${output_path}")"
+  if [[ "${actual_md5}" != "${expected_md5}" ]]; then
+    echo "Checksum mismatch after resume; downloading ${filename} again..."
+    rm -f "${output_path}"
+    curl -fL --retry 5 --retry-delay 2 \
+      "${file_url}" -o "${output_path}"
+    actual_md5="$(calculate_md5 "${output_path}")"
+  fi
+
+  if [[ "${actual_md5}" != "${expected_md5}" ]]; then
+    rm -f "${output_path}"
+    echo "Error: MD5 verification failed for ${filename}." >&2
+    exit 1
+  fi
+}
+
+download_object() {
+  local object_name="$1"
+  local object_download_dir="${download_root}/${object_name}"
+  local split_zip_path="${object_download_dir}/${object_name}.zip"
+  local merged_zip_path="${object_download_dir}/${object_name}.merged.zip"
+  local extract_dir="${object_download_dir}/extracted"
+  local extracted_object_dir="${extract_dir}/${object_name}"
+  local destination="${dataset_root}/${object_name}"
+  local backup="${object_download_dir}/previous"
+  local file_id
+  local filename
+  local expected_md5
+  local file_count=0
+  local split_count=0
+
+  mkdir -p "${object_download_dir}"
+
+  while IFS=$'\t' read -r file_id filename expected_md5; do
+    [[ -n "${file_id}" ]] || continue
+    download_file "${file_id}" "${filename}" "${expected_md5}" \
+      "${object_download_dir}/${filename}"
+    ((file_count += 1))
+    if [[ "${filename}" =~ \.z[0-9][0-9]$ ]]; then
+      ((split_count += 1))
+    fi
+  done < <(
+    jq -r --arg object_name "${object_name}" '
+      .data[]
+      | select(
+          .dataFile.filename == ($object_name + ".zip") or
+          (.dataFile.filename | test("^" + $object_name + "\\.z[0-9][0-9]$"))
+        )
+      | [
+          .dataFile.id,
+          .dataFile.filename,
+          (.dataFile.md5 // .dataFile.checksum.value // "")
+        ]
+      | @tsv
+    ' "${metadata_path}" | LC_ALL=C sort -k2,2
+  )
+
+  if (( file_count == 0 )); then
+    echo "Error: '${object_name}' is not present in the Fast-YCB release." >&2
+    exit 2
+  fi
+  if [[ ! -f "${split_zip_path}" ]]; then
+    echo "Error: ${object_name}.zip is missing from the Dataverse metadata." >&2
+    exit 1
+  fi
+
+  rm -rf "${extract_dir}"
+  mkdir -p "${extract_dir}"
+
+  if (( split_count > 0 )); then
+    echo "Joining ${file_count} archive parts for ${object_name}..."
+    rm -f "${merged_zip_path}"
+    # Use the repair/copy operation expected by the upstream Fast-YCB split
+    # archives, but only after every part has passed its published checksum.
+    zip -q -F "${split_zip_path}" --out "${merged_zip_path}"
+  else
+    merged_zip_path="${split_zip_path}"
+  fi
+
+  echo "Verifying and extracting ${object_name}..."
+  unzip -tq "${merged_zip_path}" >/dev/null
+  unzip -q "${merged_zip_path}" -d "${extract_dir}"
+
+  if [[ ! -d "${extracted_object_dir}/rgb" ||
+        ! -d "${extracted_object_dir}/depth" ||
+        ! -f "${extracted_object_dir}/cam_K.json" ||
+        ! -f "${extracted_object_dir}/dope/poses.txt" ]]; then
+    echo "Error: extracted ${object_name} is missing required sequence data." >&2
+    exit 1
+  fi
+
+  rm -rf "${backup}"
+  if [[ -e "${destination}" ]]; then
+    mv "${destination}" "${backup}"
+  fi
+
+  if ! mv "${extracted_object_dir}" "${destination}"; then
+    if [[ -e "${backup}" ]]; then
+      mv "${backup}" "${destination}"
+    fi
+    echo "Error: failed to install ${object_name}." >&2
+    exit 1
+  fi
+
+  rm -rf "${backup}" "${object_download_dir}"
+  echo "Installed Fast-YCB sequence: ${destination}"
+}
+
+for object_name in "${objects[@]}"; do
+  download_object "${object_name}"
+done
+
+rmdir "${download_root}" 2>/dev/null || true
+echo "Finished ${#objects[@]} Fast-YCB sequence(s)."

@@ -43,10 +43,14 @@ The object folders `003_cracker_box_real` and `006_mustard_bottle_real` contain 
 
 ## How to obtain the dataset
 
-Download the dataset using:
+Download one or more object sequences by name:
 ```console
-bash tools/download/download_dataset.sh
+bash tools/download/download_dataset.sh 006_mustard_bottle_real
 ```
+
+Pass multiple names to download multiple sequences. If a sequence directory
+already exists, add `--force` to replace it only after the new download has
+passed archive and checksum validation.
 
 In order to download the dataset `curl`, `jq`, `unzip` and `zip` are required.
 
