@@ -63,7 +63,7 @@ We provide [python](tools/python/sample.py) sample code to access the informatio
 pip install -r tools/python/requirements.txt
 python tools/python/sample.py <object_name>
 ```
-where `<object_name>` might be `003_cracker_box`, `004_sugar_box`, `005_tomato_soup_can`, `006_cracker_box`, `009_gelatin_box`, `010_potted_meat_can`.
+where `<object_name>` might be `003_cracker_box`, `004_sugar_box`, `005_tomato_soup_can`, `006_mustard_bottle`, `009_gelatin_box`, `010_potted_meat_can`.
 
 <p align="center"><img src="https://github.com/hsp-iit/fast-ycb/blob/main/assets/sample_rgbd_flow_mask.png" alt="" /></p>
 
