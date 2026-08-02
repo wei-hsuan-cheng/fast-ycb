@@ -52,7 +52,8 @@ Pass multiple names to download multiple sequences. If a sequence directory
 already exists, add `--force` to replace it only after the new download has
 passed archive and checksum validation.
 
-In order to download the dataset `curl`, `jq`, `unzip` and `zip` are required.
+The downloader requires `curl`, `jq`, and either `bsdtar` or both `zip` and
+`unzip`. macOS provides the `bsdtar` path by default.
 
 ## How to access data
 

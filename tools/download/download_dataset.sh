@@ -90,12 +90,21 @@ for object_name in "${objects[@]}"; do
   fi
 done
 
-for required_command in curl jq zip unzip; do
+for required_command in curl jq; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     echo "Error: required command '${required_command}' is not installed." >&2
     exit 1
   fi
 done
+
+if ! command -v bsdtar >/dev/null 2>&1; then
+  for required_command in zip unzip; do
+    if ! command -v "${required_command}" >/dev/null 2>&1; then
+      echo "Error: bsdtar or both zip and unzip are required." >&2
+      exit 1
+    fi
+  done
+fi
 
 if command -v md5sum >/dev/null 2>&1; then
   calculate_md5() {
@@ -178,6 +187,7 @@ download_object() {
   local file_id
   local filename
   local expected_md5
+  local archive_part
   local file_count=0
   local split_count=0
 
@@ -222,16 +232,32 @@ download_object() {
   if (( split_count > 0 )); then
     echo "Joining ${file_count} archive parts for ${object_name}..."
     rm -f "${merged_zip_path}"
-    # Use the repair/copy operation expected by the upstream Fast-YCB split
-    # archives, but only after every part has passed its published checksum.
-    zip -q -F "${split_zip_path}" --out "${merged_zip_path}"
+    if command -v bsdtar >/dev/null 2>&1; then
+      # libarchive reads the concatenated split stream directly. This avoids
+      # the split-archive repair issue in Apple's bundled Info-ZIP tools.
+      : > "${merged_zip_path}"
+      for archive_part in \
+        "${object_download_dir}/${object_name}".z[0-9][0-9]; do
+        cat "${archive_part}" >> "${merged_zip_path}"
+      done
+      cat "${split_zip_path}" >> "${merged_zip_path}"
+    else
+      # Use the repair/copy operation expected by the upstream Fast-YCB split
+      # archives, but only after every part passes its published checksum.
+      zip -q -F "${split_zip_path}" --out "${merged_zip_path}"
+    fi
   else
     merged_zip_path="${split_zip_path}"
   fi
 
   echo "Verifying and extracting ${object_name}..."
-  unzip -tq "${merged_zip_path}" >/dev/null
-  unzip -q "${merged_zip_path}" -d "${extract_dir}"
+  if command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -tf "${merged_zip_path}" >/dev/null
+    bsdtar -xf "${merged_zip_path}" -C "${extract_dir}"
+  else
+    unzip -tq "${merged_zip_path}" >/dev/null
+    unzip -q "${merged_zip_path}" -d "${extract_dir}"
+  fi
 
   if [[ ! -d "${extracted_object_dir}/rgb" ||
         ! -d "${extracted_object_dir}/depth" ||
