@@ -50,7 +50,8 @@ bash tools/download/download_dataset.sh 006_mustard_bottle_real
 
 Pass multiple names to download multiple sequences. If a sequence directory
 already exists, add `--force` to replace it only after the new download has
-passed archive and checksum validation.
+passed archive and checksum validation. Large Dataverse files are downloaded
+in verified byte ranges; rerun the same command to resume after an interruption.
 
 The downloader requires `curl`, `jq`, and either `bsdtar` or both `zip` and
 `unzip`. macOS provides the `bsdtar` path by default.

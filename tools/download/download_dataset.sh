@@ -136,43 +136,102 @@ download_file() {
   local file_id="$1"
   local filename="$2"
   local expected_md5="$3"
-  local output_path="$4"
+  local expected_size="$4"
+  local output_path="$5"
   local file_url="${server}/api/access/datafile/${file_id}"
   local actual_md5
+  local current_size
+  local range_end
+  local requested_size
+  local received_size
+  local response_range
+  local response_start
+  local response_total
+  local chunk_path="${output_path}.chunk"
+  local headers_path="${output_path}.headers"
+  local chunk_size="${FAST_YCB_DOWNLOAD_CHUNK_SIZE:-67108864}"
 
+  if [[ ! "${expected_size}" =~ ^[0-9]+$ || expected_size -le 0 ]]; then
+    echo "Error: invalid expected size for ${filename}: ${expected_size}." >&2
+    exit 1
+  fi
+  if [[ ! "${chunk_size}" =~ ^[0-9]+$ || chunk_size -le 0 ]]; then
+    echo "Error: FAST_YCB_DOWNLOAD_CHUNK_SIZE must be positive." >&2
+    exit 2
+  fi
+
+  current_size=0
   if [[ -f "${output_path}" ]]; then
+    current_size="$(wc -c < "${output_path}" | awk '{print $1}')"
+  fi
+
+  if (( current_size == expected_size )); then
     actual_md5="$(calculate_md5 "${output_path}")"
     if [[ "${actual_md5}" == "${expected_md5}" ]]; then
       echo "Using verified download ${filename}."
       return
     fi
-    echo "Resuming incomplete download ${filename}..."
-  else
-    echo "Downloading ${filename}..."
+    echo "Checksum mismatch in complete ${filename}; restarting it..."
+    rm -f "${output_path}"
+    current_size=0
+  elif (( current_size > expected_size )); then
+    echo "Oversized partial download ${filename}; restarting it..."
+    rm -f "${output_path}"
+    current_size=0
   fi
 
-  if ! curl -fL --retry 5 --retry-delay 2 -C - \
-    "${file_url}" -o "${output_path}"; then
-    echo "Resume was unavailable; restarting ${filename}..."
-    rm -f "${output_path}"
-    curl -fL --retry 5 --retry-delay 2 \
-      "${file_url}" -o "${output_path}"
+  if (( current_size > 0 )); then
+    echo "Resuming ${filename} at byte ${current_size}/${expected_size}..."
+  else
+    echo "Downloading ${filename}..."
+    : > "${output_path}"
   fi
+
+  while (( current_size < expected_size )); do
+    range_end=$((current_size + chunk_size - 1))
+    if (( range_end >= expected_size )); then
+      range_end=$((expected_size - 1))
+    fi
+    requested_size=$((range_end - current_size + 1))
+    rm -f "${chunk_path}" "${headers_path}"
+
+    if ! curl -fsSL --retry 5 --retry-delay 2 \
+      --range "${current_size}-${range_end}" \
+      -D "${headers_path}" "${file_url}" -o "${chunk_path}"; then
+      rm -f "${chunk_path}" "${headers_path}"
+      echo "Error: range download failed for ${filename}; rerun to resume at byte ${current_size}." >&2
+      exit 1
+    fi
+
+    response_range="$(tr -d '\r' < "${headers_path}" | awk 'tolower($1) == "content-range:" {print $3}' | tail -n 1)"
+    response_start="${response_range%%-*}"
+    response_total="${response_range##*/}"
+    received_size="$(wc -c < "${chunk_path}" | awk '{print $1}')"
+    if [[ ! "${response_start}" =~ ^[0-9]+$ ||
+          "${response_start}" != "${current_size}" ||
+          "${response_total}" != "${expected_size}" ||
+          ! "${received_size}" =~ ^[0-9]+$ ]] ||
+       (( received_size == 0 || received_size > requested_size )); then
+      rm -f "${chunk_path}" "${headers_path}"
+      echo "Error: invalid byte-range response for ${filename}; partial file was preserved." >&2
+      exit 1
+    fi
+
+    cat "${chunk_path}" >> "${output_path}"
+    current_size=$((current_size + received_size))
+    rm -f "${chunk_path}" "${headers_path}"
+    printf '  %s: %d/%d bytes (%d%%)\n' \
+      "${filename}" "${current_size}" "${expected_size}" \
+      "$((current_size * 100 / expected_size))"
+  done
 
   actual_md5="$(calculate_md5 "${output_path}")"
   if [[ "${actual_md5}" != "${expected_md5}" ]]; then
-    echo "Checksum mismatch after resume; downloading ${filename} again..."
     rm -f "${output_path}"
-    curl -fL --retry 5 --retry-delay 2 \
-      "${file_url}" -o "${output_path}"
-    actual_md5="$(calculate_md5 "${output_path}")"
-  fi
-
-  if [[ "${actual_md5}" != "${expected_md5}" ]]; then
-    rm -f "${output_path}"
-    echo "Error: MD5 verification failed for ${filename}." >&2
+    echo "Error: MD5 verification failed for ${filename}; the invalid file was removed." >&2
     exit 1
   fi
+  echo "Verified ${filename}."
 }
 
 download_object() {
@@ -187,15 +246,17 @@ download_object() {
   local file_id
   local filename
   local expected_md5
+  local expected_size
   local archive_part
   local file_count=0
   local split_count=0
 
   mkdir -p "${object_download_dir}"
 
-  while IFS=$'\t' read -r file_id filename expected_md5; do
+  while IFS=$'\t' read -r file_id filename expected_md5 expected_size; do
     [[ -n "${file_id}" ]] || continue
     download_file "${file_id}" "${filename}" "${expected_md5}" \
+      "${expected_size}" \
       "${object_download_dir}/${filename}"
     ((file_count += 1))
     if [[ "${filename}" =~ \.z[0-9][0-9]$ ]]; then
@@ -211,7 +272,8 @@ download_object() {
       | [
           .dataFile.id,
           .dataFile.filename,
-          (.dataFile.md5 // .dataFile.checksum.value // "")
+          (.dataFile.md5 // .dataFile.checksum.value // ""),
+          (.dataFile.filesize // 0)
         ]
       | @tsv
     ' "${metadata_path}" | LC_ALL=C sort -k2,2
